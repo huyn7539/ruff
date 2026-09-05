@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use ruff_db::files::{
-    File, FilePath, directory_listing, system_path_to_file, vendored_path_to_file,
+    DirectoryListing, File, FilePath, directory_listing, system_path_to_file, vendored_path_to_file,
 };
 use ruff_db::source::source_text;
-use ruff_db::system::{System, SystemPath, SystemPathBuf};
+use ruff_db::system::{FileType, System, SystemPath, SystemPathBuf};
 use ruff_db::vendored::{VendoredPath, VendoredPathBuf};
 
 use crate::Db;
@@ -84,6 +84,14 @@ impl ModulePath {
 
     pub(crate) fn pop(&mut self) -> bool {
         self.relative_path.pop()
+    }
+
+    /// Returns the last path component without its extension.
+    ///
+    /// For example, `acme/tools` and `acme/tools.py` yield `tools`,
+    /// while `acme/__init__.pyi` yields `__init__`.
+    pub(super) fn file_stem(&self) -> Option<&str> {
+        self.relative_path.file_stem()
     }
 
     pub(super) fn search_path(&self) -> &SearchPath {
@@ -227,44 +235,6 @@ impl ModulePath {
     }
 
     #[must_use]
-    pub(super) fn to_file(&self, resolver: &ResolverContext) -> Option<File> {
-        let db = resolver.db;
-        let ModulePath {
-            search_path,
-            relative_path,
-        } = self;
-        match &*search_path.0 {
-            SearchPathInner::Extra(search_path)
-            | SearchPathInner::FirstParty(search_path)
-            | SearchPathInner::SitePackages(search_path)
-            | SearchPathInner::Editable(search_path) => {
-                system_path_to_file_if_listed(db, &search_path.join(relative_path))
-            }
-            SearchPathInner::StandardLibraryReal(search_path) => {
-                system_path_to_file_if_listed(db, &search_path.join(relative_path))
-            }
-            SearchPathInner::StandardLibraryCustom(stdlib_root) => {
-                match query_stdlib_version(relative_path, resolver) {
-                    TypeshedVersionsQueryResult::DoesNotExist => None,
-                    TypeshedVersionsQueryResult::Exists
-                    | TypeshedVersionsQueryResult::MaybeExists => {
-                        system_path_to_file_if_listed(db, &stdlib_root.join(relative_path))
-                    }
-                }
-            }
-            SearchPathInner::StandardLibraryVendored(stdlib_root) => {
-                match query_stdlib_version(relative_path, resolver) {
-                    TypeshedVersionsQueryResult::DoesNotExist => None,
-                    TypeshedVersionsQueryResult::Exists
-                    | TypeshedVersionsQueryResult::MaybeExists => {
-                        vendored_path_to_file(db, stdlib_root.join(relative_path)).ok()
-                    }
-                }
-            }
-        }
-    }
-
-    #[must_use]
     pub(crate) fn to_module_name(&self) -> Option<ModuleName> {
         fn strip_stubs(component: &str) -> &str {
             component.strip_suffix("-stubs").unwrap_or(component)
@@ -315,33 +285,6 @@ impl ModulePath {
         }
     }
 
-    #[must_use]
-    pub(crate) fn with_pyi_extension(&self) -> Self {
-        let ModulePath {
-            search_path,
-            relative_path,
-        } = self;
-        ModulePath {
-            search_path: search_path.clone(),
-            relative_path: relative_path.with_extension("pyi"),
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn with_py_extension(&self) -> Option<Self> {
-        if self.is_standard_library() {
-            return None;
-        }
-        let ModulePath {
-            search_path,
-            relative_path,
-        } = self;
-        Some(ModulePath {
-            search_path: search_path.clone(),
-            relative_path: relative_path.with_extension("py"),
-        })
-    }
-
     pub(crate) fn into_search_path(self) -> SearchPath {
         self.search_path
     }
@@ -385,6 +328,121 @@ impl PartialEq<ModulePath> for VendoredPathBuf {
     }
 }
 
+/// Models a directory that participates in the module resolution process.
+#[derive(Debug, Clone)]
+pub(crate) struct ModuleDirectory<'db> {
+    // The path to the directory.
+    path: ModulePath,
+    // The contents of the directory.
+    listing: Option<&'db DirectoryListing>,
+}
+
+impl<'db> ModuleDirectory<'db> {
+    pub(crate) fn new(context: &ResolverContext<'db>, path: ModulePath) -> Self {
+        let listing = path
+            .to_system_path()
+            .and_then(|path| directory_listing(context.db, &path).ok());
+        Self { path, listing }
+    }
+
+    /// Constructs a child directory and retrieves its directory listing without
+    /// changing this directory.
+    ///
+    /// `name` should be a single path component, and the child directory need not exist.
+    pub(crate) fn child_directory(&self, context: &ResolverContext<'db>, name: &str) -> Self {
+        let mut path = self.path.clone();
+        path.push(name);
+        Self::new(context, path)
+    }
+
+    /// Returns the directory's path without permitting it to change.
+    pub(crate) fn path(&self) -> &ModulePath {
+        &self.path
+    }
+
+    /// Consumes the directory, discarding its listing and returning its path.
+    pub(crate) fn into_path(self) -> ModulePath {
+        self.path
+    }
+
+    /// Returns the cached listing from [`System`], or `None` for an inaccessible directory
+    /// or a path in the vendored typeshed archive.
+    pub(crate) fn system_listing(&self) -> Option<&'db DirectoryListing> {
+        self.listing
+    }
+
+    /// Returns whether or not this directory might contain the given entry.
+    pub(crate) fn may_contain_name(&self, name: &str) -> bool {
+        self.path.search_path.as_vendored_path().is_some()
+            || self
+                .listing
+                .is_some_and(|listing| listing.contains_name_with_prefix(name))
+    }
+
+    /// Resolves one exact filename in this directory, validating file status,
+    /// symlink targets, and typeshed availability for the configured Python version.
+    pub(crate) fn resolve_file(&self, context: &ResolverContext, filename: &str) -> Option<File> {
+        let path = Utf8Path::new(filename);
+
+        // For `pkg/tools.py`, `file_name` returns `tools.py`; comparing it with the whole
+        // input rejects the directory component. On Unix, `pkg\tools.py` is a single filename
+        // because `\` is not a separator, so reject that spelling explicitly too.
+        if path.file_name() != Some(filename) || filename.contains('\\') {
+            return None;
+        }
+
+        // `ModulePath::is_standard_library` identifies the standard-library stub roots,
+        // excluding the runtime library. A `.py` file in these roots must not be used
+        // as a fallback for a missing `.pyi` stub.
+        if self.path.is_standard_library() && path.extension() == Some("py") {
+            return None;
+        }
+
+        // For system paths, reject directories and missing entries before constructing a
+        // full path. "Missing" includes a different spelling, such as `tools.py` when only
+        // `Tools.py` is listed. Vendored paths have no system listing; the lookup below
+        // checks the archive instead. The file lookup also validates symlink targets.
+        if self.path.search_path.as_vendored_path().is_none()
+            && matches!(
+                self.listing.and_then(|listing| listing.file_type(filename)),
+                Some(FileType::Directory) | None
+            )
+        {
+            return None;
+        }
+
+        let relative_path = self.path.relative_path.join(filename);
+
+        match &*self.path.search_path.0 {
+            SearchPathInner::Extra(root)
+            | SearchPathInner::FirstParty(root)
+            | SearchPathInner::SitePackages(root)
+            | SearchPathInner::Editable(root)
+            | SearchPathInner::StandardLibraryReal(root) => {
+                system_path_to_file(context.db, root.join(&relative_path)).ok()
+            }
+            SearchPathInner::StandardLibraryCustom(root) => {
+                match query_stdlib_version(&relative_path, context) {
+                    TypeshedVersionsQueryResult::DoesNotExist => None,
+                    TypeshedVersionsQueryResult::Exists
+                    | TypeshedVersionsQueryResult::MaybeExists => {
+                        system_path_to_file(context.db, root.join(&relative_path)).ok()
+                    }
+                }
+            }
+            SearchPathInner::StandardLibraryVendored(root) => {
+                match query_stdlib_version(&relative_path, context) {
+                    TypeshedVersionsQueryResult::DoesNotExist => None,
+                    TypeshedVersionsQueryResult::Exists
+                    | TypeshedVersionsQueryResult::MaybeExists => {
+                        vendored_path_to_file(context.db, root.join(&relative_path)).ok()
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn directory_contains_file(db: &dyn Db, directory: &SystemPath, names: &[&str]) -> bool {
     let Ok(listing) = directory_listing(db, directory) else {
         return false;
@@ -393,19 +451,6 @@ fn directory_contains_file(db: &dyn Db, directory: &SystemPath, names: &[&str]) 
     names
         .iter()
         .any(|name| listing.entry_is_file(db, directory, name))
-}
-
-fn system_path_to_file_if_listed(db: &dyn Db, path: &SystemPath) -> Option<File> {
-    let Some((parent, name)) = path.parent().zip(path.file_name()) else {
-        return system_path_to_file(db, path).ok();
-    };
-
-    let listing = directory_listing(db, parent).ok()?;
-    if listing.entry_is_file(db, parent, name) {
-        system_path_to_file(db, path).ok()
-    } else {
-        None
-    }
 }
 
 fn system_path_is_directory(db: &dyn Db, path: &SystemPath) -> bool {
@@ -933,37 +978,25 @@ mod tests {
     }
 
     #[test]
-    fn with_extension_methods() {
-        let TestCase {
-            db, src, stdlib, ..
-        } = TestCaseBuilder::new()
-            .with_mocked_typeshed(MockedTypeshed::default())
-            .build();
-
-        assert_eq!(
-            SearchPath::custom_stdlib(db.system(), stdlib.parent().unwrap())
-                .unwrap()
-                .to_module_path()
-                .with_py_extension(),
-            None
+    fn resolve_file_rejects_runtime_files_in_typeshed() {
+        const TYPESHED: MockedTypeshed = MockedTypeshed {
+            versions: "foo: 3.12-",
+            stdlib_files: &[(
+                "foo.py",
+                r#"
+value = 1
+"#,
+            )],
+        };
+        let (db, stdlib_path) = typeshed_test_case(TYPESHED, PythonVersion::PY312);
+        let resolver = ResolverContext::new(
+            &db,
+            ResolverEnvironment::new(&db, PythonVersion::PY312, db.search_paths()),
+            ModuleResolveMode::Typing,
         );
+        let directory = ModuleDirectory::new(&resolver, stdlib_path.to_module_path());
 
-        assert_eq!(
-            &SearchPath::custom_stdlib(db.system(), stdlib.parent().unwrap())
-                .unwrap()
-                .join("foo")
-                .with_pyi_extension(),
-            &stdlib.join("foo.pyi")
-        );
-
-        assert_eq!(
-            &SearchPath::first_party(db.system(), src.clone())
-                .unwrap()
-                .join("foo/bar")
-                .with_py_extension()
-                .unwrap(),
-            &src.join("foo/bar.py")
-        );
+        assert_eq!(directory.resolve_file(&resolver, "foo.py"), None);
     }
 
     #[test]
@@ -1456,5 +1489,22 @@ mod tests {
         let mut mp = sp.to_module_path();
         mp.push("foo-stubs.pyi");
         assert_eq!(mp.to_module_name(), None);
+    }
+
+    impl ModulePath {
+        /// Resolves this path through the same directory validation used by the resolver.
+        fn to_file(&self, context: &ResolverContext) -> Option<File> {
+            let filename = self.relative_path.file_name()?;
+            let parent = self.relative_path.parent()?;
+            let directory = ModuleDirectory::new(
+                context,
+                ModulePath {
+                    search_path: self.search_path.clone(),
+                    relative_path: parent.to_path_buf(),
+                },
+            );
+
+            directory.resolve_file(context, filename)
+        }
     }
 }
