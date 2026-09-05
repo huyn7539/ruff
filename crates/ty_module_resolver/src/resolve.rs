@@ -1704,9 +1704,18 @@ fn resolve_component(
         return Err(());
     }
 
-    let subdirectory = directory.child_directory(context, module_name);
-    let init = resolve_file_module_with_filter(&subdirectory, context, "__init__", file_filter);
-    candidate.path = subdirectory.into_path();
+    // Only probe initializers if the directory may exist.
+    // A `tools.py` entry alone does not require probing `tools/__init__.py(i)`.
+    let may_be_directory = directory.may_contain_directory(context, module_name);
+    let init = if may_be_directory {
+        let subdirectory = directory.child_directory(context, module_name);
+        let init = resolve_file_module_with_filter(&subdirectory, context, "__init__", file_filter);
+        candidate.path = subdirectory.into_path();
+        init
+    } else {
+        candidate.path.push(module_name);
+        None
+    };
 
     if let Some(init) = init {
         // Check for a regular package first (highest priority).
@@ -1746,6 +1755,7 @@ fn resolve_component(
         // `VERSIONS` file into consideration.
         // A namespace package is not backed by a file, so it cannot satisfy a stub-only lookup.
         if file_filter != ComponentFileFilter::StubOnly
+            && may_be_directory
             && !candidate.path.search_path().is_standard_library()
             && candidate.path.is_directory(context)
         {
