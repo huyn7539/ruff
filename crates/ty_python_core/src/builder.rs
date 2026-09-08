@@ -6067,7 +6067,6 @@ fn dunder_all_extend_argument(value: &ast::Expr) -> Option<&ast::Expr> {
                 range: _,
                 node_index: _,
             },
-        ..
     } = value.as_call_expr()?;
 
     let ast::ExprAttribute { value, attr, .. } = func.as_attribute_expr()?;
@@ -6205,10 +6204,7 @@ fn is_if_not_type_checking(expr: &ast::Expr) -> bool {
 }
 
 fn is_empty_collection_constructor_call(expr: &ast::Expr) -> bool {
-    let ast::Expr::Call(ast::ExprCall {
-        func, arguments, ..
-    }) = expr
-    else {
+    let ast::Expr::Call(ast::ExprCall { func, arguments }) = expr else {
         return false;
     };
 
