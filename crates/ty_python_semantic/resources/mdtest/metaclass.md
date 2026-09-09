@@ -628,7 +628,8 @@ The metaclass of a derived class must be a (non-strict) subclass of the metaclas
 bases. ("Strict subclass" is a synonym for "proper subclass"; a non-strict subclass can be a
 subclass or the class itself.)
 
-We report the conflict and retain the candidate from the first base for attribute lookup.
+We report the conflict and retain the candidate from the first base for attribute lookup. The
+class's metaclass remains unknown when accessed through `__class__` or `type()`.
 
 ```py
 class M1(type):
@@ -641,8 +642,18 @@ class B(metaclass=M2): ...
 # error: [conflicting-metaclass] "The metaclass of a derived class (`C`) must be a subclass of the metaclasses of all its bases, but `M1` (metaclass of base class `A`) and `M2` (metaclass of base class `B`) have no subclass relationship"
 class C(A, B): ...
 
-reveal_type(C.__class__)  # revealed: <class 'M1'>
+reveal_type(C.__class__)  # revealed: type[Unknown]
+reveal_type(type(C))  # revealed: type[Unknown]
 reveal_type(C.value)  # revealed: int
+```
+
+The same distinction applies to subclasses of `C`:
+
+```py
+def check_subclass(cls: type[C]):
+    reveal_type(cls.__class__)  # revealed: type[Unknown]
+    reveal_type(type(cls))  # revealed: type[Unknown]
+    reveal_type(cls.value)  # revealed: int
 ```
 
 ## Conflict (2)
@@ -652,6 +663,7 @@ bases. ("Strict subclass" is a synonym for "proper subclass"; a non-strict subcl
 subclass or the class itself.)
 
 An explicit metaclass is retained for attribute lookup when it conflicts with a base's metaclass.
+`__class__` and `type()` still report an unknown metaclass.
 
 ```py
 class M1(type): ...
@@ -664,7 +676,8 @@ class A(metaclass=M1): ...
 # error: [conflicting-metaclass] "The metaclass of a derived class (`B`) must be a subclass of the metaclasses of all its bases, but `M2` (metaclass of `B`) and `M1` (metaclass of base class `A`) have no subclass relationship"
 class B(A, metaclass=M2): ...
 
-reveal_type(B.__class__)  # revealed: <class 'M2'>
+reveal_type(B.__class__)  # revealed: type[Unknown]
+reveal_type(type(B))  # revealed: type[Unknown]
 reveal_type(B.value)  # revealed: str
 ```
 
@@ -679,6 +692,40 @@ class B(metaclass=M): ...
 class C(A, B): ...
 
 reveal_type(C.__class__)  # revealed: <class 'M'>
+```
+
+## Conflicting metaclasses through unions and intersections
+
+A union retains the known metaclass of its valid alternative. Type aliases preserve this behavior,
+while attribute lookup can use the candidate metaclass of either alternative.
+
+```py
+from typing import Any, TypeAlias
+
+class Meta(type):
+    value: int
+
+class OtherMeta(type): ...
+class Valid(metaclass=Meta): ...
+class Other(metaclass=OtherMeta): ...
+class Invalid(Other, metaclass=Meta): ...  # error: [conflicting-metaclass]
+
+Classes: TypeAlias = type[Invalid] | type[Valid]
+
+def check_union(cls: Classes):
+    reveal_type(cls.__class__)  # revealed: type[Unknown | Meta]
+    reveal_type(type(cls))  # revealed: type[Unknown | Meta]
+    reveal_type(cls.value)  # revealed: int
+```
+
+Narrowing the invalid class to an intersection does not make its metaclass known:
+
+```py
+def check_intersection(other: Any):
+    if Invalid is other:
+        reveal_type(Invalid.__class__)  # revealed: type[Unknown]
+        reveal_type(type(Invalid))  # revealed: type[Unknown]
+        reveal_type(Invalid.value)  # revealed: int & Any
 ```
 
 ## Protocol metaclass inheritance
@@ -957,7 +1004,7 @@ class C(metaclass=M12): ...
 # error: [conflicting-metaclass] "The metaclass of a derived class (`D`) must be a subclass of the metaclasses of all its bases, but `M1` (metaclass of base class `A`) and `M2` (metaclass of base class `B`) have no subclass relationship"
 class D(A, B, C): ...
 
-reveal_type(D.__class__)  # revealed: <class 'M1'>
+reveal_type(D.__class__)  # revealed: type[Unknown]
 ```
 
 ## Unknown
@@ -1136,7 +1183,7 @@ python-version = "3.12"
 from mod import Outer
 
 reveal_type(Outer.value)  # revealed: Unknown
-reveal_type(Outer.Inner.__class__)  # revealed: <class 'Meta'>
+reveal_type(Outer.Inner.__class__)  # revealed: type[Unknown]
 ```
 
 `mod.pyi`:
@@ -1153,6 +1200,38 @@ class Outer:
     class Inner(Aliases, metaclass=Meta): ...  # error: [conflicting-metaclass]
     value: Outer.Inner.Value
     type: Outer.Inner.Value
+```
+
+## Metaclass reflection during recursive attribute inference
+
+The name `type` can refer to a metaclass obtained through an inherited alias's `__class__`
+attribute. Resolving this attribute depends on the metaclass whose bases use `type`; inference still
+converges.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from mod import Outer
+
+reveal_type(Outer.Inner.__class__)  # revealed: <class 'Meta'>
+reveal_type(type(Outer.Inner))  # revealed: <class 'Meta'>
+```
+
+`mod.pyi`:
+
+```pyi
+class Wrapper[T](type): ...
+
+class Outer:
+    class Aliases:
+        Value = int
+
+    class Meta(Wrapper[int], type): ...
+    class Inner(Aliases, metaclass=Meta): ...
+    type = Inner.Value.__class__
 ```
 
 ## PEP 695 generic
