@@ -480,6 +480,19 @@ def two_final_bounded[T: FinalClass, U: FinalClass](t: T, u: U) -> None:
     static_assert(not is_subtype_of(U, T))
 ```
 
+A typevar bounded by `int | str` is a subtype of that union, but not of either member individually:
+
+```py
+def _[T: int | str](t: T) -> None:
+    static_assert(is_assignable_to(T, int | str))
+    static_assert(not is_assignable_to(T, int))
+    static_assert(not is_assignable_to(T, str))
+
+    static_assert(is_subtype_of(T, int | str))
+    static_assert(not is_subtype_of(T, int))
+    static_assert(not is_subtype_of(T, str))
+```
+
 A constrained fully static typevar is assignable to the union of its constraints, but not to any of
 the constraints individually. None of the constraints are subtypes of the typevar, though the
 intersection of all of its constraints is a subtype of the typevar.
@@ -550,6 +563,19 @@ def constrained_by_gradual[T: (Base, Any)](t: T) -> None:
     static_assert(not is_subtype_of(Super | Unrelated, T))
     static_assert(not is_subtype_of(Intersection[Base, Unrelated], T))
     static_assert(not is_subtype_of(Intersection[Base, Any], T))
+```
+
+A bounded typevar is a subtype of a constrained typevar if its bound is a subtype of every target
+constraint:
+
+```py
+def _[S: Intersection[Base, Unrelated], T: (Base, Unrelated)](s: S, t: T) -> None:
+    static_assert(is_assignable_to(S, T))
+    static_assert(is_subtype_of(S, T))
+
+def _[S: Base, T: (Base, Unrelated)](s: S, t: T) -> None:
+    static_assert(not is_assignable_to(S, T))
+    static_assert(not is_subtype_of(S, T))
 ```
 
 Two distinct fully static typevars are not subtypes of each other, even if they have the same
@@ -910,6 +936,66 @@ def intersection_is_assignable[T](t: T) -> None:
 
     static_assert(is_subtype_of(Intersection[T, None], T))
     static_assert(is_subtype_of(Intersection[T, Not[None]], T))
+```
+
+A fully static typevar `T` is assignable to `T & Any`, but is not a subtype of it. A distinct
+typevar `U` may have a different specialization, so `T` is not assignable to `U & Any`:
+
+```py
+def _[T, U](t: T) -> None:
+    static_assert(is_assignable_to(T, Intersection[T, Any]))
+    static_assert(not is_subtype_of(T, Intersection[T, Any]))
+    static_assert(not is_assignable_to(T, Intersection[U, Any]))
+
+def _[T: object, U: object](t: T) -> None:
+    static_assert(is_assignable_to(T, Intersection[T, Any]))
+    static_assert(not is_subtype_of(T, Intersection[T, Any]))
+    static_assert(not is_assignable_to(T, Intersection[U, Any]))
+
+def _[T: (int, str), U: (int, str)](t: T) -> None:
+    static_assert(is_assignable_to(T, Intersection[T, Any]))
+    static_assert(not is_subtype_of(T, Intersection[T, Any]))
+    static_assert(not is_assignable_to(T, Intersection[U, Any]))
+```
+
+The same relation holds when the intersection is a member of a target union:
+
+```py
+def _[T: object, U: object](t: T, u: U) -> None:
+    static_assert(is_assignable_to(T, T | int))
+    static_assert(is_subtype_of(T, T | int))
+
+    static_assert(is_assignable_to(T, Intersection[T, Any] | int))
+    static_assert(not is_subtype_of(T, Intersection[T, Any] | int))
+    static_assert(not is_assignable_to(T, Intersection[U, Any] | int))
+
+def _[T: (int, str), U: (int, str)](t: T, u: U) -> None:
+    static_assert(is_assignable_to(T, T | int))
+    static_assert(is_subtype_of(T, T | int))
+
+    static_assert(is_assignable_to(T, Intersection[T, Any] | int))
+    static_assert(not is_subtype_of(T, Intersection[T, Any] | int))
+    static_assert(not is_assignable_to(T, Intersection[U, Any] | int))
+```
+
+A fully static typevar that may specialize to `int` is not assignable to `T & Any & ~int`:
+
+```py
+def _[T: object](t: T) -> None:
+    static_assert(not is_assignable_to(T, Intersection[T, Any, Not[int]]))
+    static_assert(not is_subtype_of(T, Intersection[T, Not[int]]))
+
+def _[T: (int, str)](t: T) -> None:
+    static_assert(not is_assignable_to(T, Intersection[T, Any, Not[int]]))
+    static_assert(not is_subtype_of(T, Intersection[T, Not[int]]))
+```
+
+A gradual bound does not make a typevar assignable to its own negation. Both occurrences refer to
+the same specialization:
+
+```py
+def _[T: Any](t: T) -> None:
+    static_assert(not is_assignable_to(T, Not[T]))
 ```
 
 ## Bounded typevars remain assignable to their upper bound after narrowing
